@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>Interactive CPR & AED Training | XR Blocks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <link type="text/css" rel="stylesheet" href="https://xrblocks.github.io/css/xr.css" />
+    <script>
+      window.litDisableBundleWarning = true;
+    </script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/",
+          "troika-three-text": "https://cdn.jsdelivr.net/gh/protectwise/troika@028b81cf308f0f22e5aa8e78196be56ec1997af5/packages/troika-three-text/src/index.js",
+          "troika-three-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-three-utils/src/index.js",
+          "troika-worker-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-worker-utils/src/index.js",
+          "bidi-js": "https://esm.sh/bidi-js@%5E1.0.2?target=es2022",
+          "webgl-sdf-generator": "https://esm.sh/webgl-sdf-generator@1.1.1/es2022/webgl-sdf-generator.mjs",
+          "lit": "https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js",
+          "lit/": "https://esm.run/lit@3/",
+          "xrblocks": "https://cdn.jsdelivr.net/npm/xrblocks@0.11.0/build/xrblocks.js",
+          "xrblocks/addons/": "https://cdn.jsdelivr.net/npm/xrblocks@0.11.0/build/addons/"
+        }
+      }
+    </script>
+    <style>
+      body { margin: 0; background-color: #111; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import 'xrblocks/addons/simulator/SimulatorAddons.js';
+      import * as THREE from 'three';
+      import * as xb from 'xrblocks';
+
+      // Simulation States
+      const STATES = {
+        SETUP: 0,
+        CHECK_RESPONSE: 1,
+        CPR: 2,
+        AED_ANALYZING: 3,
+        AED_SHOCK: 4,
+        RECOVERY: 5
+      };
+
+      /**
+       * Interactive CPR and AED Medical Training Simulation using XR Blocks.
+       */
+      class CPRTrainingSimulation extends xb.Script {
+        constructor() {
+          super();
+          this.state = STATES.SETUP;
+          this.compressionCount = 0;
+          this.lastCompressionTime = 0;
+          this.currentBPM = 0;
+          
+          // Audio synthesis
+          this.audioCtx = null;
+          this.nextMetronomeTick = 0;
+          this.metronomeInterval = 60 / 110; // 110 BPM target
+
+          // ECG Canvas variables
+          this.ecgX = 0;
+          this.ecgY = 128;
+          this.ecgDataQueue = [];
+          this.phase = 0;
+        }
+
+        init() {
+          this.setupLighting();
+          this.setupEnvironment();
+          this.setupPatient();
+          this.setupAED();
+          this.setupHUD();
+          this.setupECGMonitor();
+
+          // Transition to first state
+          this.changeState(STATES.CHECK_RESPONSE);
+        }
+
+        setupLighting() {
+          this.add(new THREE.HemisphereLight(0xffffff, 0x444455, 2));
+          const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+          dirLight.position.set(2, 5, 2);
+          dirLight.castShadow = true;
+          this.add(dirLight);
+        }
+
+        setupEnvironment() {
+          // Floor/Bed for the patient
+          const bedGeom = new THREE.BoxGeometry(1.2, 0.5, 2.2);
+          const bedMat = new THREE.MeshStandardMaterial({ color: 0x2c3e50 });
+          this.bed = new THREE.Mesh(bedGeom, bedMat);
+          this.bed.position.set(0, 0.25, -1.2);
+          this.add(this.bed);
+        }
+
+        setupPatient() {
+          this.patientGroup = new THREE.Group();
+          this.patientGroup.position.set(0, 0.5, -1.2);
+
+          const skinMat = new THREE.MeshStandardMaterial({ color: 0xe0ac69, roughness: 0.6 });
+          const shirtMat = new THREE.MeshStandardMaterial({ color: 0x95a5a6, roughness: 0.8 });
+
+          // Head (Interactable for response check)
+          const headGeom = new THREE.SphereGeometry(0.12, 32, 32);
+          this.head = new THREE.Mesh(headGeom, skinMat);
+          this.head.position.set(0, 0.1, -0.6);
+          this.patientGroup.add(this.head);
+
+          // Torso
+          const torsoGeom = new THREE.BoxGeometry(0.4, 0.15, 0.6);
+          this.torso = new THREE.Mesh(torsoGeom, shirtMat);
+          this.patientGroup.add(this.torso);
+
+          // Chest Target (Interactable for CPR)
+          const chestGeom = new THREE.BoxGeometry(0.15, 0.05, 0.15);
+          const chestMat = new THREE.MeshStandardMaterial({ color: 0xe74c3c, emissive: 0x330000 });
+          this.chestTarget = new THREE.Mesh(chestGeom, chestMat);
+          this.chestTarget.position.set(0, 0.08, -0.1);
+          // Store original Y for recoil animation
+          this.chestTargetBaseY = 0.08; 
+          this.patientGroup.add(this.chestTarget);
+
+          // Arms and Legs (Decorative)
+          const limbGeom = new THREE.CylinderGeometry(0.05, 0.04, 0.6);
+          limbGeom.rotateX(Math.PI / 2);
+          const armL = new THREE.Mesh(limbGeom, shirtMat);
+          armL.position.set(-0.28, 0, -0.1);
+          const armR = new THREE.Mesh(limbGeom, shirtMat);
+          armR.position.set(0.28, 0, -0.1);
+          const legGeom = new THREE.CylinderGeometry(0.06, 0.05, 0.8);
+          legGeom.rotateX(Math.PI / 2);
+          const legL = new THREE.Mesh(legGeom, skinMat);
+          legL.position.set(-0.1, 0, 0.7);
+          const legR = new THREE.Mesh(legGeom, skinMat);
+          legR.position.set(0.1, 0, 0.7);
+          
+          this.patientGroup.add(armL, armR, legL, legR);
+          this.add(this.patientGroup);
+        }
+
+        setupAED() {
+          this.aedGroup = new THREE.Group();
+          this.aedGroup.position.set(0.7, 0.55, -1.2);
+
+          // Main body
+          const boxGeom = new THREE.BoxGeometry(0.3, 0.1, 0.3);
+          const boxMat = new THREE.MeshStandardMaterial({ color: 0xf1c40f });
+          this.aedBox = new THREE.Mesh(boxGeom, boxMat);
+          this.aedGroup.add(this.aedBox);
+
+          // Shock Button (Interactable)
+          const btnGeom = new THREE.CylinderGeometry(0.05, 0.05, 0.02);
+          const btnMat = new THREE.MeshStandardMaterial({ color: 0xe74c3c });
+          this.aedButton = new THREE.Mesh(btnGeom, btnMat);
+          this.aedButton.position.set(0, 0.06, 0);
+          this.aedButton.visible = false; // Hidden until needed
+          this.aedGroup.add(this.aedButton);
+
+          this.add(this.aedGroup);
+        }
+
+        setupHUD() {
+          this.hudPanel = new xb.SpatialPanel({
+            width: 1.0,
+            height: 0.6,
+            backgroundColor: '#0f172aee',
+            useDefaultPosition: false
+          });
+          // Position HUD floating above patient
+          this.hudPanel.position.set(0, 1.6, -1.8);
+          this.add(this.hudPanel);
+
+          const grid = this.hudPanel.addGrid();
+          
+          // Header
+          grid.addRow({ weight: 0.2 }).addText({
+            text: 'CPR & AED Protocol',
+            fontSize: 0.06,
+            fontColor: '#38bdf8'
+          });
+
+          // Main Instruction
+          this.instructionText = grid.addRow({ weight: 0.4 }).addText({
+            text: 'Initializing...',
+            fontSize: 0.05,
+            fontColor: '#ffffff'
+          });
+
+          // Metrics Row
+          const metricsRow = grid.addRow({ weight: 0.4 });
+          this.bpmText = metricsRow.addCol({ weight: 0.5 }).addText({
+            text: 'BPM: --',
+            fontSize: 0.05,
+            fontColor: '#94a3b8'
+          });
+          this.depthText = metricsRow.addCol({ weight: 0.5 }).addText({
+            text: 'Depth: --',
+            fontSize: 0.05,
+            fontColor: '#94a3b8'
+          });
+
+          this.hudPanel.updateLayouts();
+        }
+
+        setupECGMonitor() {
+          // Create 2D Canvas for ECG Waveform
+          this.ecgCanvas = document.createElement('canvas');
+          this.ecgCanvas.width = 1024;
+          this.ecgCanvas.height = 256;
+          this.ecgCtx = this.ecgCanvas.getContext('2d');
+          
+          // Initial background
+          this.ecgCtx.fillStyle = '#020617';
+          this.ecgCtx.fillRect(0, 0, this.ecgCanvas.width, this.ecgCanvas.height);
+          
+          this.ecgTexture = new THREE.CanvasTexture(this.ecgCanvas);
+          
+          const monitorGeom = new THREE.PlaneGeometry(1.0, 0.25);
+          const monitorMat = new THREE.MeshBasicMaterial({ map: this.ecgTexture, side: THREE.DoubleSide });
+          this.monitorMesh = new THREE.Mesh(monitorGeom, monitorMat);
+          
+          // Attach right below the HUD panel
+          this.monitorMesh.position.set(0, 1.15, -1.8);
+          this.add(this.monitorMesh);
+        }
+
+        initAudio() {
+          if (!this.audioCtx) {
+            this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          if (this.audioCtx.state === 'suspended') {
+            this.audioCtx.resume();
+          }
+        }
+
+        playTone(freq, type, duration, vol = 0.1) {
+          if (!this.audioCtx) return;
+          const osc = this.audioCtx.createOscillator();
+          const gain = this.audioCtx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, this.audioCtx.currentTime);
+          gain.gain.setValueAtTime(vol, this.audioCtx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, this.audioCtx.currentTime + duration);
+          osc.connect(gain);
+          gain.connect(this.audioCtx.destination);
+          osc.start();
+          osc.stop(this.audioCtx.currentTime + duration);
+        }
+
+        changeState(newState) {
+          this.state = newState;
+          switch(newState) {
+            case STATES.CHECK_RESPONSE:
+              this.instructionText.setText('1. Check Response\nTap Patient\'s Head');
+              break;
+            case STATES.CPR:
+              this.instructionText.setText('2. No Response!\nBegin CPR on Red Chest Target\nMaintain 100-120 BPM');
+              this.instructionText.fontColor = '#ef4444'; // Red
+              this.nextMetronomeTick = performance.now();
+              break;
+            case STATES.AED_ANALYZING:
+              this.instructionText.setText('3. Analyzing Rhythm...\nStand Clear');
+              this.instructionText.fontColor = '#facc15'; // Yellow
+              this.bpmText.setText('');
+              this.depthText.setText('');
+              setTimeout(() => this.changeState(STATES.AED_SHOCK), 4000);
+              break;
+            case STATES.AED_SHOCK:
+              this.instructionText.setText('4. Shock Advised!\nPress Flashing AED Button');
+              this.aedButton.visible = true;
+              break;
+            case STATES.RECOVERY:
+              this.instructionText.setText('5. Shock Delivered.\nPatient Recovering. Normal Rhythm.');
+              this.instructionText.fontColor = '#4ade80'; // Green
+              this.aedButton.visible = false;
+              break;
+          }
+        }
+
+        // Interaction Handler
+        onSelectStart(event) {
+          this.initAudio(); // Ensure audio context is active
+          const controller = event.target;
+
+          // Check Head (Response)
+          if (this.state === STATES.CHECK_RESPONSE && xb.core.user.select(this.head, controller)) {
+            this.playTone(300, 'sine', 0.2);
+            this.changeState(STATES.CPR);
+            return;
+          }
+
+          // Check Chest (CPR)
+          if (this.state === STATES.CPR && xb.core.user.select(this.chestTarget, controller)) {
+            this.performCompression();
+            return;
+          }
+
+          // Check AED Button
+          if (this.state === STATES.AED_SHOCK && xb.core.user.select(this.aedButton, controller)) {
+            this.deliverShock();
+            return;
+          }
+        }
+
+        performCompression() {
+          const now = performance.now();
+          
+          // Visual Recoil
+          this.chestTarget.position.y = this.chestTargetBaseY - 0.04;
+          this.playTone(150, 'square', 0.1, 0.2); // Thud sound
+
+          // Metric calculations
+          if (this.lastCompressionTime > 0) {
+            const dt = (now - this.lastCompressionTime) / 1000;
+            const instBpm = 60 / dt;
+            // Smooth BPM
+            this.currentBPM = this.currentBPM === 0 ? instBpm : (this.currentBPM * 0.7 + instBpm * 0.3);
+            
+            // UI Feedback
+            let bpmColor = '#ef4444'; // Red (bad)
+            if (this.currentBPM >= 100 && this.currentBPM <= 120) {
+              bpmColor = '#4ade80'; // Green (good)
+            } else if (this.currentBPM > 80 && this.currentBPM < 140) {
+              bpmColor = '#facc15'; // Yellow (okay)
+            }
+            this.bpmText.setText(`BPM: ${Math.round(this.currentBPM)}`);
+            this.bpmText.fontColor = bpmColor;
+            this.depthText.setText('Depth: Good (5cm)');
+            this.depthText.fontColor = '#4ade80';
+          }
+          
+          this.lastCompressionTime = now;
+          this.compressionCount++;
+
+          // Push spike to ECG
+          this.ecgDataQueue.push({ type: 'spike' });
+
+          // Progress to AED after 20 compressions
+          if (this.compressionCount >= 20) {
+            this.changeState(STATES.AED_ANALYZING);
+          }
+        }
+
+        deliverShock() {
+          // Visual Flash
+          const flash = new THREE.Mesh(
+            new THREE.PlaneGeometry(10, 10),
+            new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8 })
+          );
+          flash.position.set(0, 0, -0.5);
+          xb.core.camera.add(flash); // Attach to camera for screen flash
+          
+          this.playTone(800, 'sawtooth', 0.5, 0.3); // Zap sound
+          
+          // Fade out flash
+          let opacity = 0.8;
+          const fadeInterval = setInterval(() => {
+            opacity -= 0.1;
+            flash.material.opacity = opacity;
+            if (opacity <= 0) {
+              clearInterval(fadeInterval);
+              xb.core.camera.remove(flash);
+            }
+          }, 50);
+
+          this.changeState(STATES.RECOVERY);
+        }
+
+        update() {
+          const now = performance.now();
+          const dt = xb.getDeltaTime();
+
+          // Recover Chest visual
+          if (this.chestTarget) {
+            this.chestTarget.position.y = THREE.MathUtils.lerp(
+              this.chestTarget.position.y, 
+              this.chestTargetBaseY, 
+              10 * dt
+            );
+          }
+
+          // Metronome during CPR
+          if (this.state === STATES.CPR && now >= this.nextMetronomeTick) {
+            this.playTone(600, 'sine', 0.05, 0.05); // High pitch tick
+            this.nextMetronomeTick = now + (this.metronomeInterval * 1000);
+          }
+
+          // Flash AED button if active
+          if (this.state === STATES.AED_SHOCK && this.aedButton) {
+            this.aedButton.material.emissive.setHex(Math.sin(now * 0.01) > 0 ? 0xff0000 : 0x000000);
+          }
+
+          this.updateECGCanvas();
+        }
+
+        updateECGCanvas() {
+          const ctx = this.ecgCtx;
+          const w = this.ecgCanvas.width;
+          const h = this.ecgCanvas.height;
+          const centerY = h / 2;
+
+          // Clear ahead of the drawing cursor
+          ctx.fillStyle = '#020617';
+          ctx.fillRect(this.ecgX + 2, 0, 15, h);
+
+          ctx.beginPath();
+          ctx.moveTo(this.ecgX, this.ecgY);
+
+          this.ecgX += 2; // Advance X
+
+          // Determine wave pattern based on state
+          let targetY = centerY;
+          this.phase += 0.05;
+
+          if (this.state === STATES.SETUP || this.state === STATES.CHECK_RESPONSE) {
+            // V-Fib (Chaotic)
+            targetY = centerY + (Math.sin(this.phase * 5) * 40 * Math.random());
+            ctx.strokeStyle = '#ef4444';
+          } 
+          else if (this.state === STATES.CPR) {
+            // Artifacts / Compressions
+            if (this.ecgDataQueue.length > 0) {
+              this.ecgDataQueue.shift();
+              // Massive spike for compression
+              targetY = centerY - 100 + (Math.random() * 200); 
+            } else {
+              // Messy baseline
+              targetY = centerY + (Math.sin(this.phase * 10) * 10);
+            }
+            ctx.strokeStyle = '#facc15';
+          }
+          else if (this.state === STATES.AED_ANALYZING || this.state === STATES.AED_SHOCK) {
+            // V-Fib returning
+            targetY = centerY + (Math.sin(this.phase * 4) * 30 * Math.random());
+            ctx.strokeStyle = '#ef4444';
+          }
+          else if (this.state === STATES.RECOVERY) {
+            // Normal Sinus Rhythm (PQRST approximation)
+            let modPhase = this.phase % (Math.PI * 2);
+            if (modPhase < 0.2) targetY = centerY - 10; // P wave
+            else if (modPhase > 0.4 && modPhase < 0.5) targetY = centerY + 10; // Q wave
+            else if (modPhase > 0.5 && modPhase < 0.6) targetY = centerY - 80; // R wave
+            else if (modPhase > 0.6 && modPhase < 0.7) targetY = centerY + 20; // S wave
+            else if (modPhase > 1.2 && modPhase < 1.6) targetY = centerY - 15; // T wave
+            else targetY = centerY; // Isoelectric line
+            
+            // Add slight noise
+            targetY += (Math.random() - 0.5) * 2;
+            ctx.strokeStyle = '#4ade80';
+          }
+
+          // Smooth interpolation
+          this.ecgY = this.ecgY + (targetY - this.ecgY) * 0.5;
+
+          ctx.lineTo(this.ecgX, this.ecgY);
+          ctx.lineWidth = 3;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+
+          // Wrap around
+          if (this.ecgX >= w) {
+            this.ecgX = 0;
+            // Clear a larger chunk at wrap to avoid artifacts
+            ctx.fillRect(0, 0, 20, h);
+          }
+
+          this.ecgTexture.needsUpdate = true;
+        }
+      }
+
+      // Initialize Application
+      document.addEventListener('DOMContentLoaded', () => {
+        const options = new xb.Options();
+        options.setAppTitle('CPR Training VR');
+        options.enableUI();
+        
+        // Setup Simulator Instructions for Desktop Fallback
+        options.simulator.instructions.customInstructions = [
+          {
+            header: 'CPR Training Simulator',
+            description: 'Follow the HUD instructions. Click on the patient\'s head to check response, then repeatedly click the red chest target to perform CPR. Maintain 100-120 BPM.'
+          }
+        ];
+
+        xb.add(new CPRTrainingSimulation());
+        xb.init(options);
+        
+        console.info('The XR app is best viewed in an Android XR device like Galaxy XR. On desktop, we provide you a simulated environment for previewing the app.');
+      });
+    </script>
+  </body>
+</html>
